@@ -1,4 +1,4 @@
-# See docs/tickets/PRD-18607.md "改动清单" and the vendor-mcp-development-sop
+# See docs/tickets/PRD-18607.md "Change list" section and the vendor-mcp-development-sop
 # attached to PRD-18607 SS8 -- this follows that SOP's reference template
 # almost verbatim (multi-stage, non-root, curl for the healthcheck).
 

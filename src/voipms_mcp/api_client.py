@@ -12,7 +12,8 @@ taken on faith from the ticket's Interview Log:
   ``internal_voicemail`` would drop every other field to its vendor default.
   This is exactly the risk PRD-18607 was filed to prevent, and it is now
   confirmed rather than assumed. See docs/tickets/PRD-18607.md "Open
-  Questions" / "风险与依赖" for the design-time assumption this resolves.
+  Questions" / "Risks and dependencies" section for the design-time
+  assumption this resolves.
 - ``getVoicemails`` (optional ``mailbox`` filter) lists voicemail mailboxes;
   mailboxes belong to the whole VOIP.ms account, not to one sub-account, so
   ``account`` is accepted by our tool for interface symmetry but not sent to
@@ -21,8 +22,9 @@ taken on faith from the ticket's Interview Log:
 The exact shape of a vendor error response (which field carries the failure
 reason) is not independently verified against a live account -- that requires
 the customer's API credentials, which are a known open dependency (see
-docs/tickets/PRD-18607.md, "风险与依赖" § 依赖 1). ``_call`` treats any
-non-"success" ``status`` field as an error and maps it conservatively.
+docs/tickets/PRD-18607.md, "Risks and dependencies" § Dependency 1). ``_call``
+treats any non-"success" ``status`` field as an error and maps it
+conservatively.
 """
 
 from __future__ import annotations
@@ -91,14 +93,22 @@ class VoipmsClient:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
-    async def _call(self, method: str, params: dict[str, object]) -> dict:
+    async def _call(self, method: str, params: dict[str, object], *, allow_none: bool = False) -> dict:
         query: dict[str, object] = {
             "api_username": self._api_username,
             "api_password": self._api_password,
             "method": method,
             "content_type": "json",
         }
-        query.update({k: v for k, v in params.items() if v is not None})
+        if allow_none:
+            # setSubAccount is a full-record write (see module docstring): a
+            # key missing from the query is reset to its vendor default, so a
+            # genuinely null field must still be sent, not dropped. The REST
+            # query string is string-only, so None becomes "" rather than
+            # being omitted or stringified to the literal word "None".
+            query.update({k: ("" if v is None else v) for k, v in params.items()})
+        else:
+            query.update({k: v for k, v in params.items() if v is not None})
 
         last_error: VoipmsApiError | None = None
         for attempt in range(_MAX_ATTEMPTS):
@@ -149,4 +159,4 @@ class VoipmsClient:
         return body.get("voicemails") or []
 
     async def set_subaccount(self, fields: dict[str, object]) -> dict:
-        return await self._call("setSubAccount", fields)
+        return await self._call("setSubAccount", fields, allow_none=True)
