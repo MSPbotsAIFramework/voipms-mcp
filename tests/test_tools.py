@@ -1,6 +1,6 @@
 """Unit tests for the four voipms_* tools, mocking the vendor API over HTTP.
 
-Test IDs (TCn) match docs/tickets/PRD-18607.md "测试用例" / PRD-18607.ac.json.
+Test IDs (TCn) match docs/tickets/PRD-18607.md "Test cases" section / PRD-18607.ac.json.
 TC12 (multi-tenant isolation) and TC13 (Library/registry deployment) are
 manual per that document -- they need a live gateway and two real tenants,
 which is not something a unit test can exercise.
@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from conftest import build_mcp, make_client, tool_result_json, tool_result_text, vendor_json_handler
+from voipms_mcp.api_client import VoipmsClient
 
 SUBACCOUNT_OPS = {
     "account": "100001_ops",
@@ -168,6 +169,36 @@ async def test_tc8_set_voicemail_redirect_preserves_other_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tc8b_null_field_sent_not_dropped_from_write() -> None:
+    """Review round 1 must-fix #1: a None-valued field on the read record
+    must still be present as a key in the setSubAccount write, or the vendor
+    resets it to its default -- the exact config-reset bug PRD-18607 exists
+    to prevent. TC8's fixture has no null fields, so it never exercised this
+    path; this test uses a record with one to close that gap."""
+    account_with_null_field = {**SUBACCOUNT_OPS, "music_on_hold": None}
+    captured: dict = {}
+
+    def responder(method: str, params: dict) -> dict:
+        if method == "getSubAccounts":
+            return {"status": "success", "accounts": [account_with_null_field]}
+        if method == "getVoicemails":
+            return {"status": "success", "voicemails": VOICEMAIL_BOXES}
+        if method == "setSubAccount":
+            captured.update(params)
+            return {"status": "success"}
+        raise AssertionError(f"unexpected method {method}")
+
+    client = make_client(vendor_json_handler(responder))
+    mcp = build_mcp(client)
+    await mcp.call_tool("voipms_set_voicemail_redirect", {"account": "100001_ops", "target_mailbox": "201"})
+
+    # The key must be present (sent as "") rather than omitted -- an omitted
+    # key is what resets the field to the vendor default.
+    assert "music_on_hold" in captured
+    assert captured["music_on_hold"] == ""
+
+
+@pytest.mark.asyncio
 async def test_tc9_invalid_target_rejected_without_vendor_write() -> None:
     write_attempted = False
 
@@ -258,3 +289,29 @@ async def test_timeout_maps_to_retryable_upstream_error() -> None:
     body = tool_result_json(result)
     assert body["error"]["code"] == "upstream_error"
     assert body["error"]["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_call_always_closes_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review round 1 must-fix #2: server.py's client_factory() builds a new
+    VoipmsClient (and its own httpx.AsyncClient connection pool) per request,
+    but no handler ever called aclose() -- every tool invocation leaked one
+    pool. Every handler, on both the success and the error path, must close
+    the client it was given."""
+    closed: list[VoipmsClient] = []
+    original_aclose = VoipmsClient.aclose
+
+    async def tracking_aclose(self: VoipmsClient) -> None:
+        closed.append(self)
+        await original_aclose(self)
+
+    monkeypatch.setattr(VoipmsClient, "aclose", tracking_aclose)
+
+    ok_client = make_client(vendor_json_handler(_accounts_and_boxes([SUBACCOUNT_OPS], VOICEMAIL_BOXES)))
+    await build_mcp(ok_client).call_tool("voipms_get_subaccount", {"account": "100001_ops"})
+    assert closed == [ok_client]
+
+    closed.clear()
+    error_client = make_client(vendor_json_handler(lambda _m, _p: {"status": "invalid_credentials"}))
+    await build_mcp(error_client).call_tool("voipms_get_subaccount", {"account": "100001_ops"})
+    assert closed == [error_client]

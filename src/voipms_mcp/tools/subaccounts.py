@@ -1,4 +1,4 @@
-"""The four voipms_* tools (PRD-18607 docs/tickets/PRD-18607.md "数据与接口契约").
+"""The four voipms_* tools (PRD-18607 docs/tickets/PRD-18607.md "Data and interface contract" section).
 
 ``voipms_set_voicemail_redirect`` is the safety-critical one: it always reads
 the full current sub-account record, validates the target mailbox exists,
@@ -11,7 +11,7 @@ record is a confirmed vendor behavior, not an assumption).
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -26,6 +26,24 @@ def _dumps(obj: object) -> str:
     # vendor-mcp-development-sop.md SS2.5: no indent, ensure_ascii=False -- both
     # are pure token cost with no benefit to the Agent consuming this.
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+async def _with_client(client_factory: ClientFactory, fn: Callable[[VoipmsClient], Awaitable[str]]) -> str:
+    """Build the per-request client, run ``fn`` with it, then always close it.
+
+    ``client_factory()`` builds a fresh ``VoipmsClient`` (and its own
+    ``httpx.AsyncClient`` connection pool) for every call; nothing closed it,
+    so every tool invocation leaked one pool. Routing every handler through
+    this one helper means there is exactly one place that guarantees
+    ``aclose()`` runs, instead of four call sites that could each forget it.
+    """
+    client = client_factory()
+    if client is None:
+        return error_envelope("not_configured", "voipms client is not configured", False)
+    try:
+        return await fn(client)
+    finally:
+        await client.aclose()
 
 
 async def _fetch_one(client: VoipmsClient, account: str) -> dict | str | None:
@@ -52,22 +70,24 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         Args:
             query: Account name or description substring to search for.
         """
-        client = client_factory()
-        if client is None:
-            return error_envelope("not_configured", "voipms client is not configured", False)
-        try:
-            accounts = await client.get_subaccounts()
-        except VoipmsApiError as exc:
-            code, retryable = map_status_code(exc.status_code)
-            return error_envelope(code, exc.message, retryable)
 
-        needle = query.strip().lower()
-        matches = [
-            {"account": entry.get("account"), "description": entry.get("description")}
-            for entry in accounts
-            if needle in (entry.get("account") or "").lower() or needle in (entry.get("description") or "").lower()
-        ]
-        return _dumps({"matches": matches})
+        async def _run(client: VoipmsClient) -> str:
+            try:
+                accounts = await client.get_subaccounts()
+            except VoipmsApiError as exc:
+                code, retryable = map_status_code(exc.status_code)
+                return error_envelope(code, exc.message, retryable)
+
+            needle = query.strip().lower()
+            matches = [
+                {"account": entry.get("account"), "description": entry.get("description")}
+                for entry in accounts
+                if needle in (entry.get("account") or "").lower()
+                or needle in (entry.get("description") or "").lower()
+            ]
+            return _dumps({"matches": matches})
+
+        return await _with_client(client_factory, _run)
 
     @mcp.tool(
         name="voipms_get_subaccount",
@@ -79,15 +99,16 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         Args:
             account: Sub-account name, e.g. '100001_ops'.
         """
-        client = client_factory()
-        if client is None:
-            return error_envelope("not_configured", "voipms client is not configured", False)
-        record = await _fetch_one(client, account)
-        if record is None:
-            return error_envelope("not_found", f"sub-account {account} not found", False)
-        if isinstance(record, str):
-            return record
-        return _dumps(record)
+
+        async def _run(client: VoipmsClient) -> str:
+            record = await _fetch_one(client, account)
+            if record is None:
+                return error_envelope("not_found", f"sub-account {account} not found", False)
+            if isinstance(record, str):
+                return record
+            return _dumps(record)
+
+        return await _with_client(client_factory, _run)
 
     @mcp.tool(
         name="voipms_list_voicemail_boxes",
@@ -102,16 +123,17 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
                 account rather than to one sub-account, so every sub-account
                 under the same credentials sees the same mailbox list.
         """
-        client = client_factory()
-        if client is None:
-            return error_envelope("not_configured", "voipms client is not configured", False)
-        try:
-            boxes = await client.get_voicemails()
-        except VoipmsApiError as exc:
-            code, retryable = map_status_code(exc.status_code)
-            return error_envelope(code, exc.message, retryable)
-        mailboxes = [{"mailbox": box.get("mailbox"), "description": box.get("description")} for box in boxes]
-        return _dumps({"mailboxes": mailboxes})
+
+        async def _run(client: VoipmsClient) -> str:
+            try:
+                boxes = await client.get_voicemails()
+            except VoipmsApiError as exc:
+                code, retryable = map_status_code(exc.status_code)
+                return error_envelope(code, exc.message, retryable)
+            mailboxes = [{"mailbox": box.get("mailbox"), "description": box.get("description")} for box in boxes]
+            return _dumps({"mailboxes": mailboxes})
+
+        return await _with_client(client_factory, _run)
 
     @mcp.tool(
         name="voipms_set_voicemail_redirect",
@@ -131,47 +153,47 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
             target_mailbox: Mailbox id to redirect voicemail to; must appear in
                 voipms_list_voicemail_boxes' result for this call to succeed.
         """
-        client = client_factory()
-        if client is None:
-            return error_envelope("not_configured", "voipms client is not configured", False)
 
-        record = await _fetch_one(client, account)
-        if record is None:
-            return error_envelope("not_found", f"sub-account {account} not found", False)
-        if isinstance(record, str):
-            return record
+        async def _run(client: VoipmsClient) -> str:
+            record = await _fetch_one(client, account)
+            if record is None:
+                return error_envelope("not_found", f"sub-account {account} not found", False)
+            if isinstance(record, str):
+                return record
 
-        try:
-            boxes = await client.get_voicemails()
-        except VoipmsApiError as exc:
-            code, retryable = map_status_code(exc.status_code)
-            return error_envelope(code, exc.message, retryable)
+            try:
+                boxes = await client.get_voicemails()
+            except VoipmsApiError as exc:
+                code, retryable = map_status_code(exc.status_code)
+                return error_envelope(code, exc.message, retryable)
 
-        valid_ids = {str(box.get("mailbox")) for box in boxes}
-        if str(target_mailbox) not in valid_ids:
-            # Reject before any write is attempted -- AC5 requires no vendor
-            # write call happens for an invalid target.
-            return error_envelope(
-                "invalid_argument",
-                f"target_mailbox {target_mailbox} is not a voicemail box on this account",
-                False,
+            valid_ids = {str(box.get("mailbox")) for box in boxes}
+            if str(target_mailbox) not in valid_ids:
+                # Reject before any write is attempted -- AC5 requires no vendor
+                # write call happens for an invalid target.
+                return error_envelope(
+                    "invalid_argument",
+                    f"target_mailbox {target_mailbox} is not a voicemail box on this account",
+                    False,
+                )
+
+            before = record.get("internal_voicemail")
+            updated_record = dict(record)
+            updated_record["internal_voicemail"] = target_mailbox
+
+            try:
+                await client.set_subaccount(updated_record)
+            except VoipmsApiError as exc:
+                code, retryable = map_status_code(exc.status_code)
+                return error_envelope(code, exc.message, retryable)
+
+            return _dumps(
+                {
+                    "account": account,
+                    "field": "internal_voicemail",
+                    "before": before,
+                    "after": target_mailbox,
+                }
             )
 
-        before = record.get("internal_voicemail")
-        updated_record = dict(record)
-        updated_record["internal_voicemail"] = target_mailbox
-
-        try:
-            await client.set_subaccount(updated_record)
-        except VoipmsApiError as exc:
-            code, retryable = map_status_code(exc.status_code)
-            return error_envelope(code, exc.message, retryable)
-
-        return _dumps(
-            {
-                "account": account,
-                "field": "internal_voicemail",
-                "before": before,
-                "after": target_mailbox,
-            }
-        )
+        return await _with_client(client_factory, _run)
